@@ -1,90 +1,114 @@
 // File: src/hashing.c
-// Audio fingerprint hash generation utilities.
-
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include "hashing.h"
-#include "types.h"
 #include "config.h"
 
-// --------------------
-// Internal Hash Helper
-// --------------------
 
-/**
- * Generates a compact 32-bit fingerprint hash from anchor frequency, target frequency, and time delta.
- * Format: [f1:10 bits][f2:10 bits][delta_t:12 bits] = 32 bits
- */
-static unsigned int generate_hash(int f1, int f2, int delta_t) {
-    return ((f1 & 0x3FF) << 22) | ((f2 & 0x3FF) << 12) | (delta_t & 0xFFF);
+// Quantize magnitude in dB (assumes peaks[].magnitude already in dB)
+static inline uint8_t quantize_mag(float mag_db) {
+    if (mag_db < 0) mag_db = 0;
+    if (mag_db > 60) mag_db = 60;
+    return (uint8_t)((mag_db / 60.0f) * 255.0f);
 }
 
-// ---------------------------
-// Fingerprint Generation API
-// ---------------------------
+// Signed 6-bit encoding: [-32, +31] → [0, 63]
+static inline int encode_delta_freq(int df) {
+    return df & 0x3F;
+}
 
-/**
- * Generates fingerprint hashes using anchor-target pairing within a fan-out window.
- *
- * @param peaks            Array of detected spectral peaks.
- * @param num_peaks        Total number of peaks in the array.
- * @param song_id          ID of the song to associate with each hash.
- * @param num_hashes_out   Pointer to store the number of hashes generated.
- * @return FingerprintHash* Pointer to dynamically allocated hash array (must be freed by caller).
- */
-FingerprintHash* generate_fingerprints(const Peak* peaks, int num_peaks, int song_id, int* num_hashes_out) {
-    if (!peaks || num_peaks <= 0 || !num_hashes_out) {
-        fprintf(stderr, "Error [generate_fingerprints]: Invalid input arguments.\n");
+// Create a 64-bit hash with optimized bit allocation
+static uint64_t generate_hash64(int a_freq, int delta_f, int dt, int a_time, uint8_t mag_q) {
+    return  (((uint64_t)(a_freq   & 0x3FF))   << 54) |  // bits 63–54: anchor freq (10 bits)
+            (((uint64_t)(delta_f  & 0x3F))    << 48) |  // bits 53–48: delta freq (6 bits)
+            (((uint64_t)(dt       & 0xFFF))   << 36) |  // bits 47–36: delta time (12 bits)
+            (((uint64_t)(mag_q    & 0xFF))    << 28) |  // bits 35–28: magnitude byte (8 bits)
+            (((uint64_t)(a_time   & 0xFFFFF)) << 8);    // bits 27–8: anchor time (20 bits)
+            // bits 7–0: reserved (unused)
+}
+
+FingerprintHash64* generate_fingerprint_hashes(const Peak* peaks,
+                                              int num_peaks,
+                                              int song_id,
+                                              int* out_count) {
+    if (!peaks || num_peaks <= 0 || !out_count) {
+        fprintf(stderr, "Error: invalid input to generate_fingerprint_hashes\n");
         return NULL;
     }
 
-    int max_hashes = num_peaks * FAN_VALUE;
-    FingerprintHash* hashes = (FingerprintHash*)malloc(max_hashes * sizeof(FingerprintHash));
-    if (!hashes) {
-        fprintf(stderr, "Error [generate_fingerprints]: Memory allocation failed for hashes.\n");
+    int capacity = num_peaks * FAN_VALUE;
+    FingerprintHash64* list = malloc(capacity * sizeof(*list));
+    if (!list) {
+        perror("malloc");
         return NULL;
     }
 
-    int count = 0;
+    int n = 0;
+    for (int i = 0; i < num_peaks; ++i) {
+        int af = peaks[i].freq_bin;
+        int at = peaks[i].time_index;
+        float am = peaks[i].magnitude;
+        uint8_t aq = quantize_mag(am);
 
-    for (int i = 0; i < num_peaks; i++) {
-        int anchor_time = peaks[i].time_index;
-        int anchor_freq = peaks[i].freq_bin;
+        if (af > MAX_FREQ_BIN || at > MAX_TIME) continue;
 
-        for (int j = 1; j <= FAN_VALUE; j++) {
-            int target_idx = i + j;
-            if (target_idx >= num_peaks)
-                break;
+        for (int j = 1; j <= FAN_VALUE; ++j) {
+            int k = i + j;
+            if (k >= num_peaks) break;
 
-            int target_time = peaks[target_idx].time_index;
-            int delta_t = target_time - anchor_time;
+            int tf = peaks[k].freq_bin;
+            int tt = peaks[k].time_index;
+            int dt = tt - at;
+            float tm = peaks[k].magnitude;
+            uint8_t tq = quantize_mag(tm);
 
-            if (delta_t < HASH_TIME_DELTA_MIN || delta_t > HASH_TIME_DELTA_MAX)
-                continue;
+            if (dt <= 0 || dt > MAX_TIME_DELTA) continue;
+            if (tf > MAX_FREQ_BIN) continue;
 
-            int target_freq = peaks[target_idx].freq_bin;
+            int df = tf - af;
+            if (df < -32 || df > 31) continue;  // signed 6-bit range check
 
-            FingerprintHash fp;
-            fp.hash = generate_hash(anchor_freq, target_freq, delta_t);
-            fp.time_offset = anchor_time;
-            fp.song_id = song_id;
+            int df_encoded = encode_delta_freq(df);
 
-            hashes[count++] = fp;
+            // Pack both magnitudes into a byte: high nibble = anchor, low = target
+            uint8_t mag_byte = ((aq >> 4) << 4) | ((tq >> 4) & 0x0F);
 
-            // Optional: Resize if unexpectedly many hashes
-            if (count >= max_hashes) {
-                max_hashes *= 2;
-                FingerprintHash* temp = (FingerprintHash*)realloc(hashes, max_hashes * sizeof(FingerprintHash));
-                if (!temp) {
-                    fprintf(stderr, "Error [generate_fingerprints]: Realloc failed at %d hashes.\n", count);
-                    free(hashes);
+            uint64_t h = generate_hash64(af, df_encoded, dt, at, mag_byte);
+            list[n++] = (FingerprintHash64){ .hash = h,
+                                             .time_offset = at,
+                                             .song_id = song_id };
+
+            if (n >= capacity) {
+                capacity *= 2;
+                FingerprintHash64* tmp = realloc(list, capacity * sizeof(*list));
+                if (!tmp) {
+                    perror("realloc");
+                    free(list);
                     return NULL;
                 }
-                hashes = temp;
+                list = tmp;
             }
         }
     }
 
-    *num_hashes_out = count;
-    return hashes;
+    // Deduplicate (in-place): same hash + time_offset
+    int w = 0;
+    for (int r = 0; r < n; ++r) {
+        uint64_t h = list[r].hash;
+        int to = list[r].time_offset;
+        int dup = 0;
+        for (int t = 0; t < w; ++t) {
+            if (list[t].hash == h && list[t].time_offset == to) {
+                dup = 1;
+                break;
+            }
+        }
+        if (!dup) {
+            list[w++] = list[r];
+        }
+    }
+
+    *out_count = w;
+    return list;
 }

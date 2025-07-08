@@ -28,7 +28,9 @@
 // ===========================
 
 #define FAN_VALUE            5           // Number of nearby points used for each hash
-#define HASH_TIME_DELTA_MIN  1
-#define HASH_TIME_DELTA_MAX  200         // Maximum time difference for target zone
+#define MAX_FREQ_BIN     1023     // 10 bits
+#define MAX_TIME_DELTA   4095     // 12 bits
+#define MAX_TIME         1048575  // 20 bits
+#define MAX_DELTA_FREQ   31       // for signed 6-bit range [-32, +31]
 
 #endif // CONFIG_H

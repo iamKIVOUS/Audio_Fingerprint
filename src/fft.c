@@ -58,7 +58,8 @@ void fft(Complex* x, int n) {
 
 // Compute magnitude spectrum |X[k]| for k in [0..n-1].
 void compute_magnitude_spectrum(const Complex* x, float* magnitude, int n) {
-    for (int i = 0; i < n; ++i) {
+    int half = n / 2;  // Only compute half spectrum
+    for (int i = 0; i < half; ++i) {
         magnitude[i] = sqrtf(x[i].real * x[i].real + x[i].imag * x[i].imag);
     }
 }
