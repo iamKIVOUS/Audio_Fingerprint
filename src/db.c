@@ -1,70 +1,77 @@
 // File: src/db.c
-// Database utility functions for song and fingerprint storage.
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "sqlite3.h"
 #include <sys/stat.h>
+#include "sqlite3.h"
 #include "db.h"
 
-// Check if a file exists at the given path.
-int db_file_exists(const char* path) {
+static sqlite3* db = NULL;  // Global database connection
+
+static int db_file_exists(const char* path) {
     struct stat buffer;
     return (stat(path, &buffer) == 0);
 }
 
-// Initialize (open or create) a SQLite database at the given path.
-int db_init(sqlite3** db, const char* path) {
-    if (!db_file_exists(path)) {
-        printf("Database file does not exist. Creating a new one...\n");
+int db_open(const char* path) {
+    if (db_file_exists(path)) {
+        printf("Opening existing database: %s\n", path);
     } else {
-        printf("Opening existing database...\n");
+        printf("Creating new database: %s\n", path);
     }
-    return sqlite3_open(path, db);
+
+    int rc = sqlite3_open(path, &db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "Failed to open DB: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    return db_create_tables();  // Ensure tables exist
 }
 
-// Close an open SQLite database.
-void db_close(sqlite3* db) {
-    if (db) sqlite3_close(db);
+void db_close() {
+    if (db) {
+        sqlite3_close(db);
+        db = NULL;
+    }
 }
 
-// Create required tables and indexes if they do not exist.
-int db_create_tables(sqlite3* db) {
-    char* err = NULL;
-
-    const char* create_songs_sql =
+int db_create_tables() {
+    const char* songs_sql =
         "CREATE TABLE IF NOT EXISTS Songs ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "id INTEGER PRIMARY KEY, "
         "name TEXT NOT NULL, "
         "artist TEXT NOT NULL, "
-        "UNIQUE(name, artist));";  // Ensure uniqueness on song name + artist
+        "UNIQUE(name, artist));";
 
-    const char* create_fingerprints_sql =
+    const char* fingerprints_sql =
         "CREATE TABLE IF NOT EXISTS Fingerprints ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "id INTEGER PRIMARY KEY, "
         "hash TEXT NOT NULL, "
         "time_offset INTEGER NOT NULL, "
         "song_id INTEGER NOT NULL, "
-        "FOREIGN KEY(song_id) REFERENCES Songs(id));";
+        "FOREIGN KEY(song_id) REFERENCES Songs(id), "
+        "UNIQUE(hash, time_offset, song_id)); ";
 
-    const char* create_index_sql =
+    const char* index_sql =
         "CREATE INDEX IF NOT EXISTS idx_hash ON Fingerprints(hash);";
 
-    if (sqlite3_exec(db, create_songs_sql, 0, 0, &err) != SQLITE_OK) {
-        fprintf(stderr, "Songs table error: %s\n", err);
+    char* err = NULL;
+
+    if (sqlite3_exec(db, songs_sql, 0, 0, &err) != SQLITE_OK) {
+        fprintf(stderr, "Error creating Songs table: %s\n", err);
         sqlite3_free(err);
         return -1;
     }
 
-    if (sqlite3_exec(db, create_fingerprints_sql, 0, 0, &err) != SQLITE_OK) {
-        fprintf(stderr, "Fingerprints table error: %s\n", err);
+    if (sqlite3_exec(db, fingerprints_sql, 0, 0, &err) != SQLITE_OK) {
+        fprintf(stderr, "Error creating Fingerprints table: %s\n", err);
         sqlite3_free(err);
         return -1;
     }
 
-    if (sqlite3_exec(db, create_index_sql, 0, 0, &err) != SQLITE_OK) {
-        fprintf(stderr, "Index creation error: %s\n", err);
+    if (sqlite3_exec(db, index_sql, 0, 0, &err) != SQLITE_OK) {
+        fprintf(stderr, "Error creating index: %s\n", err);
         sqlite3_free(err);
         return -1;
     }
@@ -72,12 +79,12 @@ int db_create_tables(sqlite3* db) {
     return 0;
 }
 
-// Find a song by name and artist. Returns 1 if found, 0 if not, -1 on error.
-int db_find_song(sqlite3* db, const char* name, const char* artist, int* song_id) {
+int db_find_song(const char* name, const char* artist, int* song_id) {
     sqlite3_stmt* stmt;
     const char* sql = "SELECT id FROM Songs WHERE name = ? AND artist = ?;";
 
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
 
     sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, artist, -1, SQLITE_TRANSIENT);
@@ -86,54 +93,55 @@ int db_find_song(sqlite3* db, const char* name, const char* artist, int* song_id
     if (rc == SQLITE_ROW) {
         *song_id = sqlite3_column_int(stmt, 0);
         sqlite3_finalize(stmt);
-        return 1; // Found
+        return 1;
     }
 
     sqlite3_finalize(stmt);
-    return 0; // Not found
+    return 0;
 }
 
-// Insert a new song if not already present. Returns 0 on insert, 1 if duplicate, -1 on error.
-int db_insert_song(sqlite3* db, const char* name, const char* artist, int* song_id) {
-    int found = db_find_song(db, name, artist, song_id);
+int db_insert_song(const char* name, const char* artist, int* song_id) {
+    int found = db_find_song(name, artist, song_id);
     if (found == 1) {
-        printf("Duplicate song detected: '%s' by '%s'. Using existing song_id: %d\n", name, artist, *song_id);
+        printf("Duplicate song: '%s' by '%s', ID=%d\n", name, artist, *song_id);
         return 1;
     } else if (found == -1) {
-        fprintf(stderr, "Error checking for duplicate song.\n");
         return -1;
     }
 
     sqlite3_stmt* stmt;
     const char* sql = "INSERT INTO Songs (name, artist) VALUES (?, ?);";
 
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
 
     sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 2, artist, -1, SQLITE_TRANSIENT);
 
-    int rc = sqlite3_step(stmt);
+    if (sqlite3_step(stmt) != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return -1;
+    }
+
     sqlite3_finalize(stmt);
-
-    if (rc != SQLITE_DONE) return -1;
-
     *song_id = (int)sqlite3_last_insert_rowid(db);
     return 0;
 }
 
-// Insert a fingerprint hash for a song. Returns 0 on success, -1 on error.
-int db_insert_fingerprint(sqlite3* db, const char* hash, int time_offset, int song_id) {
+int db_insert_fingerprint(const char* hash, int time_offset, int song_id) {
     sqlite3_stmt* stmt;
-    const char* sql = "INSERT INTO Fingerprints (hash, time_offset, song_id) VALUES (?, ?, ?);";
+    const char* sql = "INSERT OR IGNORE INTO Fingerprints (hash, time_offset, song_id) VALUES (?, ?, ?);";
 
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) return -1;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return -1;
 
     sqlite3_bind_text(stmt, 1, hash, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 2, time_offset);
     sqlite3_bind_int(stmt, 3, song_id);
 
     int rc = sqlite3_step(stmt);
+    int changes = sqlite3_changes(db);  // Get number of rows actually inserted
     sqlite3_finalize(stmt);
 
-    return (rc == SQLITE_DONE) ? 0 : -1;
+    return (rc == SQLITE_DONE && changes > 0) ? 0 : 1;  // 0 = inserted, 1 = duplicate ignored
 }
