@@ -1,118 +1,120 @@
 // File: src/song_entry.c
-// Song database entry and fingerprinting pipeline.
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <stdint.h>
 #include <dirent.h>
-#include "sqlite3.h"
-#include "config.h"
+#include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "audio_io.h"
 #include "spectrogram.h"
 #include "peak_detection.h"
 #include "hashing.h"
-#include "db.h"
 #include "types.h"
+#include "config.h"
+#include "db.h"
 
-// Process a single song file: build spectrogram, detect peaks, generate hashes, and store in DB.
-void process_song_file(const char* filepath, sqlite3* songs_db, sqlite3* fingerprints_db) {
+#define MAX_PATH_LEN 1024
+
+int is_audio_file(const char* filename) {
+    const char* ext = strrchr(filename, '.');
+    return ext && (strcmp(ext, ".wav") == 0 || strcmp(ext, ".mp3") == 0);
+}
+
+void process_file(const char* filepath, const char* filename) {
+    const char* song_name = filename;
+    const char* artist_name = "Unknown";  // Default, can be improved later
+
+    int song_id = -1;
+    if (db_insert_song(song_name, artist_name, &song_id) < 0) {
+        fprintf(stderr, "Failed to insert song into database.\n");
+        return;
+    }
+
+    // If duplicate, skip
+    if (song_id == -1) {
+        printf("Skipping duplicate song: %s\n", song_name);
+        return;
+    }
+
+    printf("Processing: %s\n", filepath);
+
     float** spectrogram = NULL;
     int num_frames = 0, num_bins = 0;
 
-    // Build spectrogram from file
-    if (build_spectrogram(filepath, &spectrogram, &num_frames, &num_bins) != 0) {
-        fprintf(stderr, "Failed to build spectrogram for %s\n", filepath);
+    if (build_spectrogram(filepath, &spectrogram, &num_frames, &num_bins) != 0 || !spectrogram) {
+        fprintf(stderr, "Spectrogram generation failed for: %s\n", filepath);
         return;
     }
 
-    // Extract song name and artist (basic filename parsing: artist-title.wav)
-    const char* filename = strrchr(filepath, '/');
-    if (!filename) filename = filepath;
-    else filename++;  // skip '/'
-
-    char name[256] = {0}, artist[256] = {0};
-    sscanf(filename, "%[^-]-%[^.]", artist, name);
-
-    // Insert song into songs.db and get song_id
-    int song_id = -1;
-    if (db_insert_song(songs_db, name, artist, &song_id) != 0 || song_id < 0) {
-        fprintf(stderr, "Failed to insert/find song in database: %s - %s\n", artist, name);
-        // Clean up
-        for (int i = 0; i < num_frames; i++) free(spectrogram[i]);
-        free(spectrogram);
-        return;
-    }
-
-    // Peak Detection
     int num_peaks = 0;
     Peak* peaks = detect_peaks(spectrogram, num_frames, num_bins, &num_peaks);
-    if (!peaks || num_peaks == 0) {
-        fprintf(stderr, "No peaks found in %s\n", filepath);
+    if (!peaks) {
+        fprintf(stderr, "Peak detection failed.\n");
         goto cleanup;
     }
 
-    // Hashing
-    int num_hashes = 0;
-    FingerprintHash* hashes = generate_fingerprints(peaks, num_peaks, song_id, &num_hashes);
-    if (!hashes || num_hashes == 0) {
-        fprintf(stderr, "No hashes generated for %s\n", filepath);
+    printf("Detected %d peaks.\n", num_peaks);
+
+    int hash_count = 0;
+    FingerprintHash64* hashes = generate_fingerprint_hashes(peaks, num_peaks, song_id, &hash_count);
+    if (!hashes || hash_count == 0) {
+        fprintf(stderr, "Hash generation failed or returned zero hashes.\n");
         goto cleanup;
     }
 
-    // Insert hashes into fingerprint DB
-    for (int i = 0; i < num_hashes; i++) {
-        char hash_str[16];
-        snprintf(hash_str, sizeof(hash_str), "%08X", hashes[i].hash);
-        if (db_insert_fingerprint(fingerprints_db, hash_str, hashes[i].time_offset, hashes[i].song_id) != 0) {
-            fprintf(stderr, "Failed to insert hash %s\n", hash_str);
-        }
+    printf("Generated %d hashes. Inserting into DB...\n", hash_count);
+
+    int inserted = 0, skipped = 0;
+    for (int i = 0; i < hash_count; i++) {
+        char hex_hash[17];
+        snprintf(hex_hash, sizeof(hex_hash), "%016lX", hashes[i].hash);
+        int status = db_insert_fingerprint(hex_hash, hashes[i].time_offset, hashes[i].song_id);
+        if (status == 0)
+            inserted++;
+        else if (status == 1)
+            skipped++;
+        else
+            fprintf(stderr, "Failed to insert hash %d into DB.\n", i);
     }
 
-    printf("Processed %s: %d peaks, %d hashes\n", filepath, num_peaks, num_hashes);
+    printf("Inserted %d/%d hashes (%d duplicates skipped).\n", inserted, hash_count, skipped);
 
 cleanup:
-    for (int i = 0; i < num_frames; i++) free(spectrogram[i]);
-    free(spectrogram);
-    free(peaks);
-    free(hashes);
+    if (peaks) free(peaks);
+    if (hashes) free(hashes);
+    if (spectrogram) {
+        for (int i = 0; i < num_frames; i++) free(spectrogram[i]);
+        free(spectrogram);
+    }
 }
 
-// Main entry point: processes all WAV files in the songs folder and stores fingerprints in DB.
 int main() {
-    // Open songs DB
-    sqlite3* songs_db = NULL;
-    if (db_init(&songs_db, SONGS_DB_PATH) != 0) return 1;
-    db_create_tables(songs_db);
-
-    // Open fingerprint DB
-    sqlite3* fingerprints_db = NULL;
-    if (db_init(&fingerprints_db, FINGERPRINTS_DB_PATH) != 0) {
-        db_close(songs_db);
+    if (db_open(DB_PATH) != 0) {
+        fprintf(stderr, "Failed to open/create DB at %s\n", DB_PATH);
         return 1;
     }
-    db_create_tables(fingerprints_db);
 
-    // Read all WAV files from songs folder
     DIR* dir = opendir(SONGS_FOLDER);
     if (!dir) {
-        perror("opendir");
-        db_close(songs_db);
-        db_close(fingerprints_db);
+        perror("Failed to open songs folder");
+        db_close();
         return 1;
     }
 
     struct dirent* entry;
-    while ((entry = readdir(dir)) != NULL) {
-        if (strstr(entry->d_name, ".wav")) {
-            char filepath[512];
-            snprintf(filepath, sizeof(filepath), "%s%s", SONGS_FOLDER, entry->d_name);
-            process_song_file(filepath, songs_db, fingerprints_db);
+    while ((entry = readdir(dir))) {
+        char filepath[MAX_PATH_LEN];
+        snprintf(filepath, MAX_PATH_LEN, "%s%s", SONGS_FOLDER, entry->d_name);
+
+        struct stat path_stat;
+        if (stat(filepath, &path_stat) == 0 && S_ISREG(path_stat.st_mode) && is_audio_file(entry->d_name)) {
+            process_file(filepath, entry->d_name);
         }
     }
 
     closedir(dir);
-    db_close(songs_db);
-    db_close(fingerprints_db);
-
+    db_close();
     return 0;
 }
