@@ -19,8 +19,6 @@
 // ===========================
 
 #define SONGS_FOLDER         "songs/"
-#define SONGS_DB_PATH        "data/songs.db"         // Songs metadata
-#define FINGERPRINTS_DB_PATH "data/fingerprints.db"  // Fingerprint hashes
 #define DB_PATH              "data/audio_fingerprint.db" // Audio fingerprints
 
 // ===========================
